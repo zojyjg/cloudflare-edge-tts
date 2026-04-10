@@ -6,6 +6,11 @@ type TtsBody = {
   voice?: unknown;
 };
 
+function isJsonContentType(value: string) {
+  const mediaType = value.split(";")[0]?.trim().toLowerCase();
+  return mediaType === "application/json";
+}
+
 function parseBody(body: unknown) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new Error("request body must be an object");
@@ -27,9 +32,39 @@ function parseBody(body: unknown) {
   };
 }
 
+async function primeAudioStream(stream: ReadableStream<Uint8Array>) {
+  const reader = stream.getReader();
+  const firstChunk = await reader.read();
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        if (!firstChunk.done && firstChunk.value) {
+          controller.enqueue(firstChunk.value);
+        }
+
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) {
+            controller.close();
+            return;
+          }
+
+          controller.enqueue(chunk.value);
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason);
+    },
+  });
+}
+
 export async function handleTts(request: Request) {
   const contentType = request.headers.get("content-type") ?? "";
-  if (!contentType.toLowerCase().includes("application/json")) {
+  if (!isJsonContentType(contentType)) {
     return errorResponse(
       400,
       "INVALID_CONTENT_TYPE",
@@ -37,21 +72,35 @@ export async function handleTts(request: Request) {
     );
   }
 
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse(
+      400,
+      "INVALID_REQUEST",
+      "request body must be valid json"
+    );
+  }
+
   let parsed: ReturnType<typeof parseBody>;
 
   try {
-    parsed = parseBody(await request.json());
+    parsed = parseBody(body);
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "request body must be valid json";
-
-    return errorResponse(400, "INVALID_REQUEST", message);
+    return errorResponse(
+      400,
+      "INVALID_REQUEST",
+      error instanceof Error ? error.message : "request body must be valid json"
+    );
   }
 
   try {
     const stream = await createAudioStream(parsed);
+    const primedStream = await primeAudioStream(stream);
 
-    return new Response(stream, {
+    return new Response(primedStream, {
       status: 200,
       headers: {
         ...CORS_HEADERS,
